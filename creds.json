@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "bingobot-467500",
+  "private_key_id": "5daa42717ba8740a41fe0780d0573a48c83803bc",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDNwY/HvKV/gWc/\nGVenUbKCd8zEWqm/VAMd0pAHzLHRYs+OQq0dNK+klNdYOzEA8djKn+wHv/UoD28h\n+/lUazXCUnTAN+jZbLJA9Ldf1pOVcLJ6H1YJZOREpqR2xO0+EDUvgwVaMlqy1PbZ\nd6htz34dHorW4bfW0TIH2rEI8u5uZy20cj9p5p3IhdS3mZ0OAqioPYVB6TZOFv3i\n5sh2o4boL+ATFa4o6aRkAkhBi4sBvNV3IfSTorgcteg8btJbRZsJarT9avT0uawf\n2Pk0n0Qqrh+CzpCRZjr4b3qrR23jyzSbHBJouPK4eLfNP8TvMJU+7+zVPwCAYwx6\nmfdnnl/HAgMBAAECggEAG0jAGrHq1kogGU9wfqkIPWHKfv0wxkTLNwCthcNAjy4F\nrO0tjJJoejAckEAlIuVvJItpXqu3RC0rxPtnWCjxU4fgoH6pe299Ab0Rtf07y9TK\nbgRKweslk+7vHyrE9PZsPxUmOAw2V8GCzFqgNJOPuyfKLG15FdzewAjhcfjY4j3C\ncjU+4we6BwIvYuXghbAheReDQFgnqvVqLwbS0vIt/OM8LBgQVL2SiPgUImbHj/pc\nbYfyP6qeCxm8qNd0okU3meurXPDH+8YIXvKee/1QocRgyGznd5AJP2XwG54L5Fvp\nfgLJ0iQ5ovgMUO+4riSlR6UYFTgazlfsbKWZ3ehbmQKBgQDxD/d6gjw/0j0qrR4z\nn0Q0QtIAIutApd6Uj/8TuLS9yW6N2JeNgPy96SK9soaHHWdQs7XscoubjLX2Byla\n5H3scwDI5ZY/4YYYm7fy/06kBfO/SNRNeJwgTooWNmBWN4r9WwkjjAQcDxUxaBq7\nm1g+Xsq/VoR4wVXxNNraaHhczwKBgQDagYXMVbcXSWRMZKxMgOKfqaEQRH5/MMwi\n6FPsIPQxaYqDi5jJ7Ju44OzaXAgBli+JNvFvssar/AMTX/dvQOCTyryo7UZ9LYk0\nbZRhsy2F/2As+e57dvM7ey+Q68nXSBns7nBoER/kuM3m9QOGb/PenyasX7CO5Ckr\n7bZR3187iQKBgQC2kSMaszuyEiWlBouTCRH8iobE9603vud9mDjU1NR9z+pcnybY\nUlIX+lMHXAeqmMhARHqJYo789WpxtCbL4bTEuKxlegt6wfBu/rAn5tfGPYPG4P94\n1NlZVmIaRIBdi59GFgYr18TdA0dHrdJhN1tzkRL4KiwV0EaocSE2vFw73QKBgQCZ\nSo6sSGH3U0SrF2GNFkpmyqE1AWhhIMHFp4nguUm3NJy5JoEdAAJLVHi1xCTVwCA/\nOi1tOFWKqHUb7ZJwGWq0JGHwfO2bugtsnYegdwxz2jIFu51kPpHrY8N9/v0OLAYM\nI0b2qzTdyAyjf7ZmZToIL0z5VvRNeqGrsMvcakGsSQKBgHrIa2NEJk+QL/fzP1Ma\nvqbLh5fC1+oYdytN93tAIyOEPAg6tAWU3rK8CCT2hbKW5EjmYSycDuxDRwfynnpY\n1TkwDbRW7YO0/Gx4zSl1hUbMn/mqG75Ry4uxIO53l8ZBnDc+/GXj1kngLzMhxstl\nnpVjoTzCKJA2vdqBrPYHBail\n-----END PRIVATE KEY-----\n",
+  "client_email": "bingobot@bingobot-467500.iam.gserviceaccount.com",
+  "client_id": "101198994983939945550",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/bingobot%40bingobot-467500.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
