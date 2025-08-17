@@ -49,10 +49,12 @@ tiles_activities_sheet = None
 submission_sheet = None
 team_sheet = None
 competition_info_sheet = None
+compiled_messages_sheet = None  # NEW
 
 # Data caches
 tile_names: list[str] = []            # unique tile names (column A)
 tile_items: dict[str, list[str]] = {} # tile -> items (from column C)
+compiled_tile_numbers: list[str] = [] # NEW: column A of Compiled Messages by Team
 SUBMISSION_HEADER: list[str] | None = None  # cached header for Submissions
 
 def split_items_field(s: str) -> list[str]:
@@ -102,10 +104,27 @@ def _load_from_tiles_sheet():
 
     return names_ordered, dict(items_map)
 
+def _load_compiled_tile_numbers() -> list[str]:
+    """Load unique tile numbers from column A of 'Compiled Messages by Team'."""
+    try:
+        rows = compiled_messages_sheet.get_all_values()
+    except Exception:
+        return []
+    out, seen = [], set()
+    for row in rows[1:]:
+        if not row:
+            continue
+        t = (row[0] if len(row) >= 1 else "").strip()
+        if t and t.lower() not in seen:
+            out.append(t)
+            seen.add(t.lower())
+    return out
+
 async def init_sheets_with_retry(max_tries: int = 5):
     """Initialize gspread + worksheets + caches (non-blocking)."""
     global gs_client, spreadsheet, tiles_activities_sheet, submission_sheet, team_sheet, competition_info_sheet
     global tile_names, tile_items, SUBMISSION_HEADER
+    global compiled_messages_sheet, compiled_tile_numbers  # NEW
     wait = 2
     for attempt in range(1, max_tries + 1):
         try:
@@ -117,8 +136,10 @@ async def init_sheets_with_retry(max_tries: int = 5):
             submission_sheet = await asyncio.to_thread(spreadsheet.worksheet, "Submissions")
             team_sheet = await asyncio.to_thread(spreadsheet.worksheet, "TeamDetails")
             competition_info_sheet = await asyncio.to_thread(spreadsheet.worksheet, "CompetitionInformation")
+            compiled_messages_sheet = await asyncio.to_thread(spreadsheet.worksheet, "Compiled Messages by Team")  # NEW
 
             tile_names, tile_items = await asyncio.to_thread(_load_from_tiles_sheet)
+            compiled_tile_numbers = await asyncio.to_thread(_load_compiled_tile_numbers)  # NEW
 
             try:
                 SUBMISSION_HEADER = await asyncio.to_thread(submission_sheet.row_values, 1)
@@ -141,7 +162,7 @@ async def init_sheets_with_retry(max_tries: int = 5):
 def sheets_ready() -> bool:
     return HEALTH["sheets_ready"] and all([
         gs_client, spreadsheet, tiles_activities_sheet,
-        submission_sheet, team_sheet, competition_info_sheet
+        submission_sheet, team_sheet, competition_info_sheet, compiled_messages_sheet
     ])
 
 def is_server_mode() -> bool:
@@ -172,6 +193,53 @@ def get_channel_ids_for_submission(submission_id: str):
     except Exception as e:
         HEALTH["last_error"] = f"TeamDetails lookup error: {e}"
         log.warning(HEALTH["last_error"])
+    return None
+
+async def get_team_index_for_channel(channel_id: int) -> int | None:
+    """
+    For /tileprogress: Only allow from TeamDetails column F channels.
+    Team 1 = A2 (row index 2), Team 2 = A3 (row index 3).
+    """
+    try:
+        rows = await asyncio.to_thread(team_sheet.get_all_values)
+    except Exception:
+        return None
+
+    # Ensure we have at least rows 2 & 3
+    # Column F is index 5 (0-based)
+    def parse_chan(val: str) -> int | None:
+        try:
+            return int(str(val).strip())
+        except Exception:
+            return None
+
+    # Row 2 -> Team 1
+    if len(rows) >= 2:
+        row2 = rows[1]
+        if len(row2) >= 6:
+            chan = parse_chan(row2[5])
+            if chan and chan == channel_id:
+                return 1
+
+    # Row 3 -> Team 2
+    if len(rows) >= 3:
+        row3 = rows[2]
+        if len(row3) >= 6:
+            chan = parse_chan(row3[5])
+            if chan and chan == channel_id:
+                return 2
+
+    # Fallback: scan all rows and infer from column A text "Team 1"/"Team 2"
+    for idx, row in enumerate(rows[1:], start=2):
+        if len(row) >= 6 and parse_chan(row[5]) == channel_id:
+            name = (row[0] or "").strip()
+            m = re.search(r"(\d+)", name)
+            if m:
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    pass
+            return 1
     return None
 
 def parse_submission_from_embed(embed: discord.Embed):
@@ -432,7 +500,7 @@ async def process_approval(interaction: discord.Interaction, original_message: d
 
     await interaction.followup.send("✅ Approved and recorded.", ephemeral=True)
 
-# ==================== Autocomplete (Tiles only) ====================
+# ==================== Autocomplete ====================
 async def tile_autocomplete(interaction: discord.Interaction, current: str):
     cur = (current or "").lower()
     return [
@@ -440,6 +508,41 @@ async def tile_autocomplete(interaction: discord.Interaction, current: str):
         for tile in tile_names
         if cur in tile.lower()
     ][:25]
+
+async def compiled_tile_autocomplete(interaction: discord.Interaction, current: str):
+    cur = (current or "").lower()
+    return [
+        app_commands.Choice(name=t, value=t)
+        for t in compiled_tile_numbers
+        if cur in t.lower()
+    ][:25]
+
+# ==================== Compiled message lookup ====================
+async def fetch_compiled_message(tile_number: str, team_index: int) -> str | None:
+    """
+    In 'Compiled Messages by Team':
+      - Column A: Tile number
+      - Column B: Team 1 compiled message
+      - Column C: Team 2 compiled message
+    """
+    try:
+        rows = await asyncio.to_thread(compiled_messages_sheet.get_all_values)
+    except Exception:
+        return None
+
+    tile_key = str(tile_number).strip()
+    for row in rows[1:]:  # skip header
+        if not row:
+            continue
+        a = (row[0] if len(row) >= 1 else "").strip()
+        if a == tile_key:
+            if team_index == 1:
+                return (row[1] if len(row) >= 2 else "")
+            elif team_index == 2:
+                return (row[2] if len(row) >= 3 else "")
+            else:
+                return ""
+    return None
 
 # ==================== Events ====================
 @bot.event
@@ -531,6 +634,46 @@ async def submit(
         await interaction.followup.send(f"❌ Couldn't post to approval channel: {e}", ephemeral=True); return
 
     await interaction.followup.send("✅ Submission received and sent for approval.", ephemeral=True)
+
+@tree.command(name="tileprogress", description="Show compiled tile progress for your team")
+@app_commands.describe(tile_number="Tile number (matches column A in 'Compiled Messages by Team')")
+@app_commands.autocomplete(tile_number=compiled_tile_autocomplete)
+async def tileprogress(interaction: discord.Interaction, tile_number: str):
+    if not sheets_ready():
+        await interaction.response.send_message("⚠ Setup is still starting. Try again shortly.", ephemeral=True)
+        return
+
+    # Only allowed from the channel listed in TeamDetails!F for Team 1/2
+    team_idx = await get_team_index_for_channel(interaction.channel.id)
+    if team_idx not in (1, 2):
+        await interaction.response.send_message(
+            "❌ You can only use this in your team’s designated channel (TeamDetails column F).",
+            ephemeral=True
+        )
+        return
+
+    msg = await fetch_compiled_message(tile_number, team_idx)
+    if msg is None:
+        await interaction.response.send_message(
+            f"❌ Tile `{tile_number}` not found in ‘Compiled Messages by Team’.",
+            ephemeral=True
+        )
+        return
+    if not msg:
+        await interaction.response.send_message(
+            f"ℹ No compiled message for tile `{tile_number}` (Team {team_idx}).",
+            ephemeral=True
+        )
+        return
+
+    # Post publicly; chunk if >2000 chars
+    chunks = [msg[i:i+2000] for i in range(0, len(msg), 2000)]
+    await interaction.response.send_message(chunks[0], allowed_mentions=discord.AllowedMentions.none())
+    for extra in chunks[1:]:
+        try:
+            await interaction.followup.send(extra, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            break
 
 @tree.command(name="health", description="Show bot health/status")
 async def health(interaction: discord.Interaction):
