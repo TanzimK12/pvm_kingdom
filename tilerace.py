@@ -24,12 +24,12 @@ log = logging.getLogger("bingo-bot")
 # ==================== ENV ====================
 load_dotenv()
 DISCORD_TOKEN = os.getenv("discord_token")
-SHEET_NAME = os.getenv("BINGO_SHEET_NAME", "MainBingoSheet")
+SHEET_NAME = os.getenv("BINGO_SHEET_NAME", "SeptemberPVMEvent")
+TEST_GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional: per-guild fast sync
 
 # ==================== DISCORD (no privileged intents) ====================
 intents = discord.Intents.default()
-intents.guilds = True  # minimal; no message_content/members needed
-
+intents.guilds = True  # minimal
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
@@ -50,22 +50,62 @@ submission_sheet = None
 team_sheet = None
 competition_info_sheet = None
 
-tile_activities = {}  # {tile: [activities]}
+# Data caches
+tile_names: list[str] = []            # unique tile names (column A)
+tile_items: dict[str, list[str]] = {} # tile -> items (from column C)
+SUBMISSION_HEADER: list[str] | None = None  # cached header for Submissions
 
-def _load_tile_activities_from_sheet():
+def split_items_field(s: str) -> list[str]:
+    """Split on comma/semicolon/real newline; trim & dedupe case-insensitively."""
+    if not s:
+        return []
+    parts = re.split(r"\s*(?:[,;]|\r?\n)\s*", s.strip())
+    out, seen = [], set()
+    for p in parts:
+        if p and p.lower() not in seen:
+            out.append(p)
+            seen.add(p.lower())
+    return out
+
+def _load_from_tiles_sheet():
+    """
+    TilesActivities columns:
+      A: Tile
+      B: Activity (ignored)
+      C: Items (comma/semicolon/newline separated)
+    """
     rows = tiles_activities_sheet.get_all_values()
-    tile_map = defaultdict(list)
+    names_ordered: list[str] = []
+    seen_names: set[str] = set()
+    items_map: dict[str, list[str]] = defaultdict(list)
+
     for row in rows[1:]:
-        if len(row) < 2:
+        if not row:
             continue
-        tile, activity = row[0].strip(), row[1].strip()
-        if activity and activity not in tile_map[tile]:
-            tile_map[tile].append(activity)
-    return dict(tile_map)
+        tile = (row[0] if len(row) >= 1 else "").strip()
+        items_raw = (row[2] if len(row) >= 3 else "").strip()
+        if not tile:
+            continue
+
+        key = tile.lower()
+        if key not in seen_names:
+            names_ordered.append(tile)
+            seen_names.add(key)
+
+        for it in split_items_field(items_raw):
+            if it.lower() not in {x.lower() for x in items_map[tile]}:
+                items_map[tile].append(it)
+
+    # Cap to Discord select max 25
+    for t, arr in list(items_map.items()):
+        items_map[t] = arr[:25]
+
+    return names_ordered, dict(items_map)
 
 async def init_sheets_with_retry(max_tries: int = 5):
-    """Initialize gspread + worksheets + cache tile_activities with retries (non-blocking)."""
-    global gs_client, spreadsheet, tiles_activities_sheet, submission_sheet, team_sheet, competition_info_sheet, tile_activities
+    """Initialize gspread + worksheets + caches (non-blocking)."""
+    global gs_client, spreadsheet, tiles_activities_sheet, submission_sheet, team_sheet, competition_info_sheet
+    global tile_names, tile_items, SUBMISSION_HEADER
     wait = 2
     for attempt in range(1, max_tries + 1):
         try:
@@ -77,7 +117,14 @@ async def init_sheets_with_retry(max_tries: int = 5):
             submission_sheet = await asyncio.to_thread(spreadsheet.worksheet, "Submissions")
             team_sheet = await asyncio.to_thread(spreadsheet.worksheet, "TeamDetails")
             competition_info_sheet = await asyncio.to_thread(spreadsheet.worksheet, "CompetitionInformation")
-            tile_activities = await asyncio.to_thread(_load_tile_activities_from_sheet)
+
+            tile_names, tile_items = await asyncio.to_thread(_load_from_tiles_sheet)
+
+            try:
+                SUBMISSION_HEADER = await asyncio.to_thread(submission_sheet.row_values, 1)
+            except Exception:
+                SUBMISSION_HEADER = None
+
             HEALTH["sheets_ready"] = True
             HEALTH["last_error"] = ""
             log.info("[Sheets] Ready.")
@@ -128,15 +175,13 @@ def get_channel_ids_for_submission(submission_id: str):
     return None
 
 def parse_submission_from_embed(embed: discord.Embed):
-    """Extract fields from the approval embed."""
-    vals = {"tile": None, "activity": None, "user_display": None, "image_url": None,
+    """Extract Tile, user, image, timestamp, SID from the approval embed."""
+    vals = {"tile": None, "user_display": None, "image_url": None,
             "timestamp_str": None, "submission_id": None}
     for f in embed.fields:
         n = (f.name or "").lower()
         if n == "tile":
             vals["tile"] = f.value
-        elif n == "activity":
-            vals["activity"] = f.value
         elif n == "submitted by":
             vals["user_display"] = f.value
     if embed.image and embed.image.url:
@@ -163,121 +208,117 @@ def archive_embed(embed: discord.Embed, status: str):
     archived.set_footer(text=(embed.footer.text or "") + " • Archived")
     return archived
 
-# ==================== UI components ====================
+# ==================== Permissions ====================
 REQUIRE_APPROVER_PERMS = True
-PERSISTENT_VIEW_CUSTOM_IDS = ("bingo:approve", "bingo:deny")
+def approver_check(user: discord.abc.User) -> bool:
+    if not isinstance(user, discord.Member):
+        return False
+    p = user.guild_permissions
+    return bool(p.administrator or p.manage_messages)
 
+# ==================== Approval flow state ====================
+# Store ephemeral approver choices per (approval_message_id, approver_id)
+APPROVAL_STATE: dict[tuple[int, int], dict] = {}
+
+# ==================== UI Components ====================
 class AmountModal(ui.Modal, title="Enter Amount"):
-    amount = ui.TextInput(label="Amount", placeholder="e.g., 1", required=True, max_length=10)
+    amount = ui.TextInput(label="Amount", placeholder="Enter a positive integer", required=True, max_length=12)
 
-    def __init__(self, original_message: discord.Message):
+    def __init__(self, original_message: discord.Message, invoker_id: int):
         super().__init__(timeout=180)
         self.original_message = original_message
+        self.invoker_id = invoker_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        if REQUIRE_APPROVER_PERMS:
-            perms = interaction.user.guild_permissions
-            if not (perms.administrator or perms.manage_messages):
-                await interaction.response.send_message("❌ You don't have permission to approve.", ephemeral=True)
-                return
+        # Defer first so followups are valid (fixes Unknown Webhook)
+        await interaction.response.defer(ephemeral=True)
 
+        if REQUIRE_APPROVER_PERMS and not approver_check(interaction.user):
+            await interaction.followup.send("❌ You don't have permission to approve.", ephemeral=True)
+            return
         if not sheets_ready():
-            await interaction.response.send_message("⚠ Sheets are still starting up. Try again in a moment.", ephemeral=True)
+            await interaction.followup.send("⚠ Sheets are still starting up. Try again in a moment.", ephemeral=True)
+            return
+        if not self.original_message.embeds:
+            await interaction.followup.send("❌ Missing submission embed.", ephemeral=True)
             return
 
-        embed = self.original_message.embeds[0] if self.original_message.embeds else None
-        if not embed:
-            await interaction.response.send_message("❌ Missing embed data.", ephemeral=True)
-            return
-
-        # Amount validation
+        # Validate amount
         try:
             amt = int(str(self.amount.value).strip())
             if amt <= 0:
                 raise ValueError
         except Exception:
-            await interaction.response.send_message("❌ Amount must be a positive integer.", ephemeral=True)
+            await interaction.followup.send("❌ Amount must be a positive integer.", ephemeral=True)
             return
 
-        data = parse_submission_from_embed(embed)
-        submission_id = data["submission_id"]
-        if not submission_id:
-            await interaction.response.send_message("❌ Missing submission ID.", ephemeral=True)
+        # Fetch previously chosen item
+        key = (self.original_message.id, self.invoker_id)
+        state = APPROVAL_STATE.get(key) or {}
+        chosen_item = state.get("item")
+        if not chosen_item:
+            await interaction.followup.send("❌ Please pick an item first.", ephemeral=True)
             return
 
-        channel_info = get_channel_ids_for_submission(submission_id)
-        if not channel_info:
-            await interaction.response.send_message("❌ Could not find target channels for this submission.", ephemeral=True)
+        embed = self.original_message.embeds[0]
+        await process_approval(interaction, self.original_message, embed, amt, chosen_item)
+        APPROVAL_STATE.pop(key, None)
+
+class ItemSelect(ui.Select):
+    def __init__(self, items: list[str], original_message: discord.Message, invoker_id: int):
+        opts = [discord.SelectOption(label=item[:100], value=item[:100]) for item in (items or ["Unknown"])]
+        super().__init__(placeholder="Select item", min_values=1, max_values=1, options=opts[:25], custom_id="bingo:item_select")
+        self.original_message = original_message
+        self.invoker_id = invoker_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("This prompt isn’t for you.", ephemeral=True)
+            return
+        if REQUIRE_APPROVER_PERMS and not approver_check(interaction.user):
+            await interaction.response.send_message("❌ You don't have permission to approve.", ephemeral=True)
+            return
+        if not self.original_message or not self.original_message.embeds:
+            await interaction.response.send_message("❌ Missing submission embed.", ephemeral=True)
             return
 
-        # Append to sheet using ORIGINAL timestamp from user submission
-        try:
-            await asyncio.to_thread(
-                submission_sheet.append_row,
-                [
-                    data["timestamp_str"] or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    submission_id,
-                    data["user_display"] or interaction.user.display_name,
-                    data["tile"] or "",
-                    data["activity"] or "",
-                    amt,
-                    data["image_url"] or "",
-                ],
-                value_input_option="USER_ENTERED"  # <-- correct usage
-            )
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to record in Sheets: {e}", ephemeral=True)
-            return
+        selected_item = self.values[0]
+        APPROVAL_STATE[(self.original_message.id, self.invoker_id)] = {"item": selected_item}
 
-        # Forward to approved channel w/ amount
-        approved_channel = interaction.client.get_channel(channel_info["approved"])
-        if approved_channel:
-            approved_embed = discord.Embed(title=embed.title, color=discord.Color.green())
-            for f in embed.fields:
-                if f.name.lower() == "amount":
-                    continue
-                approved_embed.add_field(name=f.name, value=f.value, inline=f.inline)
-            approved_embed.add_field(name="Amount", value=str(amt), inline=True)
-            if embed.image and embed.image.url:
-                approved_embed.set_image(url=embed.image.url)
-            approved_embed.set_footer(text=embed.footer.text)
-            try:
-                await approved_channel.send(embed=approved_embed, allowed_mentions=discord.AllowedMentions.none())
-            except Exception:
-                pass
+        # Next: prompt amount
+        await interaction.response.send_modal(AmountModal(original_message=self.original_message, invoker_id=self.invoker_id))
 
-        # Archive approval message
-        try:
-            await self.original_message.edit(embed=archive_embed(embed, "Approved"), view=None)
-        except Exception:
-            pass
-
-        await interaction.response.send_message("✅ Approved and recorded.", ephemeral=True)
+class ItemSelectView(ui.View):
+    def __init__(self, items: list[str], original_message: discord.Message, invoker_id: int):
+        super().__init__(timeout=180)
+        self.add_item(ItemSelect(items=items, original_message=original_message, invoker_id=invoker_id))
 
 class ApproveDenyView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)  # persistent
 
-    @ui.button(label="Approve", style=discord.ButtonStyle.success, custom_id=PERSISTENT_VIEW_CUSTOM_IDS[0])
+    @ui.button(label="Approve", style=discord.ButtonStyle.success, custom_id="bingo:approve")
     async def approve(self, interaction: discord.Interaction, button: ui.Button):
-        if REQUIRE_APPROVER_PERMS:
-            perms = interaction.user.guild_permissions
-            if not (perms.administrator or perms.manage_messages):
-                await interaction.response.send_message("❌ You don't have permission to approve.", ephemeral=True)
-                return
+        if REQUIRE_APPROVER_PERMS and not approver_check(interaction.user):
+            await interaction.response.send_message("❌ You don't have permission to approve.", ephemeral=True)
+            return
         if not interaction.message or not interaction.message.embeds:
             await interaction.response.send_message("❌ Missing submission embed.", ephemeral=True)
             return
-        await interaction.response.send_modal(AmountModal(original_message=interaction.message))
 
-    @ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id=PERSISTENT_VIEW_CUSTOM_IDS[1])
+        embed = interaction.message.embeds[0]
+        data = parse_submission_from_embed(embed)
+        tile = data["tile"] or ""
+        items = tile_items.get(tile) or ["Unknown"]
+
+        view = ItemSelectView(items=items, original_message=interaction.message, invoker_id=interaction.user.id)
+        await interaction.response.send_message("Select the item for this submission:", view=view, ephemeral=True)
+
+    @ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="bingo:deny")
     async def deny(self, interaction: discord.Interaction, button: ui.Button):
-        if REQUIRE_APPROVER_PERMS:
-            perms = interaction.user.guild_permissions
-            if not (perms.administrator or perms.manage_messages):
-                await interaction.response.send_message("❌ You don't have permission to deny.", ephemeral=True)
-                return
-
+        if REQUIRE_APPROVER_PERMS and not approver_check(interaction.user):
+            await interaction.response.send_message("❌ You don't have permission to deny.", ephemeral=True)
+            return
         if not sheets_ready():
             await interaction.response.send_message("⚠ Sheets still starting; try again shortly.", ephemeral=True)
             return
@@ -318,51 +359,121 @@ class ApproveDenyView(ui.View):
 
         await interaction.response.send_message("🚫 Denied.", ephemeral=True)
 
-# ==================== Autocomplete ====================
+# ==================== Shared approval logic ====================
+async def process_approval(interaction: discord.Interaction, original_message: discord.Message, embed: discord.Embed, amt: int, item: str):
+    """Writes to Sheets (with original timestamp), forwards to approved channel, archives message."""
+    if not sheets_ready():
+        await interaction.followup.send("⚠ Sheets are still starting up. Try again in a moment.", ephemeral=True)
+        return
+
+    data = parse_submission_from_embed(embed)
+    submission_id = data["submission_id"]
+    if not submission_id:
+        await interaction.followup.send("❌ Missing submission ID.", ephemeral=True)
+        return
+
+    channel_info = get_channel_ids_for_submission(submission_id)
+    if not channel_info:
+        await interaction.followup.send("❌ Could not find target channels for this submission.", ephemeral=True)
+        return
+
+    # Detect if Submissions sheet still has an "Activity" column
+    header_lower = [h.lower() for h in (SUBMISSION_HEADER or [])]
+    has_activity_col = "activity" in header_lower
+
+    row = [
+        data["timestamp_str"] or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        submission_id,
+        data["user_display"] or interaction.user.display_name,
+        data["tile"] or "",
+    ]
+    if has_activity_col:
+        row.append("")  # blank Activity to keep columns aligned
+    row.extend([
+        item or "",
+        int(amt),
+        data["image_url"] or "",
+    ])
+
+    # Append to sheet
+    try:
+        await asyncio.to_thread(
+            submission_sheet.append_row,
+            row,
+            value_input_option="USER_ENTERED"
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to record in Sheets: {e}", ephemeral=True)
+        return
+
+    # Forward to approved channel (Tile + Item + Amount)
+    approved_channel = interaction.client.get_channel(channel_info["approved"])
+    if approved_channel:
+        approved_embed = discord.Embed(title=embed.title, color=discord.Color.green())
+        for f in embed.fields:
+            if f.name.lower() in ("item", "amount"):
+                continue
+            approved_embed.add_field(name=f.name, value=f.value, inline=f.inline)
+        approved_embed.add_field(name="Item", value=str(item), inline=True)
+        approved_embed.add_field(name="Amount", value=str(amt), inline=True)
+        if embed.image and embed.image.url:
+            approved_embed.set_image(url=embed.image.url)
+        approved_embed.set_footer(text=embed.footer.text)
+        try:
+            await approved_channel.send(embed=approved_embed, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            pass
+
+    # Archive approval message (remove buttons)
+    try:
+        await original_message.edit(embed=archive_embed(embed, "Approved"), view=None)
+    except Exception:
+        pass
+
+    await interaction.followup.send("✅ Approved and recorded.", ephemeral=True)
+
+# ==================== Autocomplete (Tiles only) ====================
 async def tile_autocomplete(interaction: discord.Interaction, current: str):
     cur = (current or "").lower()
     return [
         app_commands.Choice(name=tile, value=tile)
-        for tile in tile_activities.keys()
+        for tile in tile_names
         if cur in tile.lower()
-    ][:25]
-
-async def activity_autocomplete(interaction: discord.Interaction, current: str):
-    focused = interaction.namespace
-    tile_name = getattr(focused, "tile_name", None)
-    if not tile_name or tile_name not in tile_activities:
-        return []
-    cur = (current or "").lower()
-    return [
-        app_commands.Choice(name=a, value=a)
-        for a in tile_activities[tile_name]
-        if cur in a.lower()
     ][:25]
 
 # ==================== Events ====================
 @bot.event
 async def on_ready():
-    # Register persistent buttons so they keep working after restarts
-    bot.add_view(ApproveDenyView())
-
-    # Kick off Sheets init in the background (non-blocking)
-    asyncio.create_task(init_sheets_with_retry())
-
-    # DO NOT call tree.sync() here (avoid slow boots). Use /resync when you need to push updates.
+    bot.add_view(ApproveDenyView())              # persistent buttons
+    asyncio.create_task(init_sheets_with_retry())# warm Sheets in background
     log.info(f"🤖 Bot is online as {bot.user}")
 
+    # ---------- FORCE SYNC to fix CommandSignatureMismatch ----------
+    try:
+        if TEST_GUILD_ID:
+            guild_obj = discord.Object(id=int(TEST_GUILD_ID))
+            tree.clear_commands(guild=guild_obj)
+            tree.copy_global_to(guild=guild_obj)
+            await tree.sync(guild=guild_obj)
+            log.info(f"✅ Per-guild commands resynced for {TEST_GUILD_ID}")
+        await tree.sync()
+        log.info("✅ Global commands synced")
+    except Exception as e:
+        log.warning(f"⚠ Command sync failed: {e}")
+
 # ==================== Commands ====================
-@tree.command(name="submit", description="Submit a tile completion with required image (amount added by approver).")
+@tree.command(
+    name="submit",
+    description="Submit a tile completion with required image (approver selects item and enters amount)."
+)
 @app_commands.describe(
     tile_name="Choose the tile",
-    activity_name="Choose the activity",
     image="Attach an image (required)",
 )
-@app_commands.autocomplete(tile_name=tile_autocomplete, activity_name=activity_autocomplete)
+@app_commands.autocomplete(tile_name=tile_autocomplete)
 async def submit(
     interaction: discord.Interaction,
     tile_name: str,
-    activity_name: str,
     image: discord.Attachment,
 ):
     if interaction.guild is None:
@@ -390,15 +501,9 @@ async def submit(
         await interaction.response.send_message("❌ This server/channel is not registered for submissions.", ephemeral=True)
         return
 
-    # Validate inputs (uses cached tile_activities)
-    if tile_name not in tile_activities:
+    if tile_name not in tile_names:
         await interaction.response.send_message(
-            f"❌ Invalid tile name. Available: {', '.join(tile_activities.keys()) or '…loading'}",
-            ephemeral=True,
-        ); return
-    if activity_name not in tile_activities[tile_name]:
-        await interaction.response.send_message(
-            f"❌ Invalid activity for {tile_name}. Available: {', '.join(tile_activities[tile_name]) or '…loading'}",
+            f"❌ Invalid tile. Available: {', '.join(tile_names) or '…loading'}",
             ephemeral=True,
         ); return
     if not image:
@@ -416,7 +521,6 @@ async def submit(
 
     embed = discord.Embed(title=f"📝 Submission from {user_display}", color=discord.Color.orange())
     embed.add_field(name="Tile", value=tile_name, inline=True)
-    embed.add_field(name="Activity", value=activity_name, inline=True)
     embed.add_field(name="Submitted By", value=user_display, inline=True)
     embed.set_image(url=image_url)
     embed.set_footer(text=f"Submitted at {timestamp} • SID {submission_lookup_id}")
@@ -442,8 +546,13 @@ async def health(interaction: discord.Interaction):
 async def resync(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
+        if TEST_GUILD_ID:
+            guild_obj = discord.Object(id=int(TEST_GUILD_ID))
+            tree.clear_commands(guild=guild_obj)
+            tree.copy_global_to(guild=guild_obj)
+            await tree.sync(guild=guild_obj)
         await tree.sync()
-        await interaction.followup.send("✅ Global commands synced.", ephemeral=True)
+        await interaction.followup.send("✅ Commands resynced.", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
 
