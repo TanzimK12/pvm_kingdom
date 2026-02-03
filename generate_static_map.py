@@ -92,7 +92,7 @@ def get_example_region_totals():
     i = 0
     for region in REGION_NAMES:
         fake[region] = {
-            "blue": (i * 2) % 7,
+            "blue": (i * 3) % 7,
             "red": (i * 3) % 5,
             "control": "Blue" if i % 3 == 0 else ("Red" if i % 3 == 1 else "None"),
         }
