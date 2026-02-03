@@ -1,0 +1,8 @@
+# Ignore everything by default
+*
+
+# Allow git metadata
+!.gitignore
+
+# Allow ONLY the generated image
+!pvm_static_output.png
